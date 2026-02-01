@@ -1,6 +1,6 @@
 module github.com/xtls/xray-core
 
-go 1.25
+go 1.23.0
 
 require (
 	github.com/cloudflare/circl v1.6.2
