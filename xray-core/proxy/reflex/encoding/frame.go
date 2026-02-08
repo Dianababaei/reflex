@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -12,11 +13,11 @@ import (
 
 // Frame types
 const (
-	FrameTypeData        byte = 0x01 // DATA frame
-	FrameTypePadding     byte = 0x02 // PADDING_CTRL frame
-	FrameTypeTiming      byte = 0x03 // TIMING_CTRL frame
-	FrameTypeClose       byte = 0x04 // CLOSE frame
-	MaxFramePayloadSize  int  = 16384 // Maximum payload size (16KB)
+	FrameTypeData       byte = 0x01  // DATA frame
+	FrameTypePadding    byte = 0x02  // PADDING_CTRL frame
+	FrameTypeTiming     byte = 0x03  // TIMING_CTRL frame
+	FrameTypeClose      byte = 0x04  // CLOSE frame
+	MaxFramePayloadSize int  = 16384 // Maximum payload size (16KB)
 )
 
 // Frame represents a Reflex protocol frame
@@ -30,6 +31,7 @@ type FrameEncoder struct {
 	aead    cipher.AEAD
 	nonce   []byte
 	counter uint64
+	mu      sync.Mutex // Protects nonce and counter access
 }
 
 // NewFrameEncoder creates a new frame encoder with the session key
@@ -50,9 +52,15 @@ func NewFrameEncoder(sessionKey []byte) (*FrameEncoder, error) {
 // NOTE: The returned buffer is pooled. Caller must use immediately or copy,
 // then call PutFrameBuffer to return it to the pool.
 func (e *FrameEncoder) Encode(frame *Frame) ([]byte, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	// Increment counter for nonce
 	e.counter++
-	binary.LittleEndian.PutUint64(e.nonce, e.counter)
+
+	// Create local nonce for this operation (prevent nonce reuse across concurrent calls)
+	nonce := make([]byte, e.aead.NonceSize())
+	binary.LittleEndian.PutUint64(nonce, e.counter)
 
 	// Get pooled buffer for plaintext: [type(1)] + [payload]
 	plaintextSize := 1 + len(frame.Payload)
@@ -67,8 +75,8 @@ func (e *FrameEncoder) Encode(frame *Frame) ([]byte, error) {
 	ciphertextBuf := GetFrameBuffer(ciphertextCapacity)
 	defer PutFrameBuffer(ciphertextBuf)
 
-	// Encrypt directly into pooled buffer
-	ciphertext := e.aead.Seal(ciphertextBuf[:0], e.nonce, plaintext[:plaintextSize], nil)
+	// Encrypt directly into pooled buffer (all under lock to prevent AEAD race)
+	ciphertext := e.aead.Seal(ciphertextBuf[:0], nonce, plaintext[:plaintextSize], nil)
 
 	// Get pooled buffer for final frame: [length(2)] + [ciphertext]
 	frameDataSize := 2 + len(ciphertext)
@@ -83,9 +91,15 @@ func (e *FrameEncoder) Encode(frame *Frame) ([]byte, error) {
 // EncodeToWriter encodes and writes directly to writer (zero-copy optimized)
 // This method handles buffer pooling internally, avoiding an extra allocation.
 func (e *FrameEncoder) EncodeToWriter(w io.Writer, frame *Frame) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	// Increment counter for nonce
 	e.counter++
-	binary.LittleEndian.PutUint64(e.nonce, e.counter)
+
+	// Create local nonce for this operation (prevent nonce reuse across concurrent calls)
+	nonce := make([]byte, e.aead.NonceSize())
+	binary.LittleEndian.PutUint64(nonce, e.counter)
 
 	// Get pooled buffer for plaintext: [type(1)] + [payload]
 	plaintextSize := 1 + len(frame.Payload)
@@ -100,8 +114,8 @@ func (e *FrameEncoder) EncodeToWriter(w io.Writer, frame *Frame) error {
 	ciphertextBuf := GetFrameBuffer(ciphertextCapacity)
 	defer PutFrameBuffer(ciphertextBuf)
 
-	// Encrypt directly into pooled buffer
-	ciphertext := e.aead.Seal(ciphertextBuf[:0], e.nonce, plaintext[:plaintextSize], nil)
+	// Encrypt directly into pooled buffer (all under lock to prevent AEAD race)
+	ciphertext := e.aead.Seal(ciphertextBuf[:0], nonce, plaintext[:plaintextSize], nil)
 
 	// Get pooled buffer for final frame: [length(2)] + [ciphertext]
 	frameDataSize := 2 + len(ciphertext)
@@ -126,6 +140,7 @@ type FrameDecoder struct {
 	aead    cipher.AEAD
 	nonce   []byte
 	counter uint64
+	mu      sync.Mutex // Protects nonce and counter access
 }
 
 // NewFrameDecoder creates a new frame decoder with the session key
@@ -156,16 +171,22 @@ func (d *FrameDecoder) Decode(data []byte) (*Frame, error) {
 
 	ciphertext := data[2 : 2+length]
 
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	// Increment counter for nonce
 	d.counter++
-	binary.LittleEndian.PutUint64(d.nonce, d.counter)
+
+	// Create local nonce for this operation (prevent nonce reuse across concurrent calls)
+	nonce := make([]byte, d.aead.NonceSize())
+	binary.LittleEndian.PutUint64(nonce, d.counter)
 
 	// Get pooled buffer for plaintext decryption
 	plaintextBuf := GetFrameBuffer(len(ciphertext))
 	defer PutFrameBuffer(plaintextBuf)
 
-	// Decrypt directly into pooled buffer
-	plaintext, err := d.aead.Open(plaintextBuf[:0], d.nonce, ciphertext, nil)
+	// Decrypt directly into pooled buffer (all under lock to prevent AEAD race)
+	plaintext, err := d.aead.Open(plaintextBuf[:0], nonce, ciphertext, nil)
 	if err != nil {
 		return nil, errors.New("decryption failed")
 	}
